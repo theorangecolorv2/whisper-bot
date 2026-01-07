@@ -1,0 +1,217 @@
+{
+    "dns": {
+        "hosts": {
+            "cloudflare-dns.com": "1.1.1.1",
+            "dns.google": "8.8.8.8"
+        },
+        "queryStrategy": "UseIPv4",
+        "servers": [
+            "94.140.14.14",
+            {
+                "address": "94.140.14.14",
+                "domains": [
+                    "geosite:youtube",
+                    "geosite:category-ban-ru"
+                ],
+                "port": 53
+            },
+            {
+                "address": "94.140.15.15",
+                "domains": [
+                    "geosite:private",
+                    "geosite:category-ru",
+                    "geosite:apple",
+                    "geosite:twitch"
+                ],
+                "port": 53
+            }
+        ]
+    },
+    "inbounds": [
+        {
+            "listen": "127.0.0.1",
+            "port": 10808,
+            "protocol": "socks",
+            "settings": {
+                "auth": "noauth",
+                "udp": true,
+                "userLevel": 8
+            },
+            "sniffing": {
+                "destOverride": [
+                    "http",
+                    "tls",
+                    "quic"
+                ],
+                "enabled": true
+            },
+            "tag": "socks"
+        },
+        {
+            "listen": "127.0.0.1",
+            "port": 10809,
+            "protocol": "http",
+            "settings": {
+                "userLevel": 8
+            },
+            "sniffing": {
+                "destOverride": [
+                    "http",
+                    "tls",
+                    "quic"
+                ],
+                "enabled": true
+            },
+            "tag": "http"
+        },
+        {
+            "listen": "127.0.0.1",
+            "port": 11111,
+            "protocol": "dokodemo-door",
+            "settings": {
+                "address": "127.0.0.1"
+            },
+            "tag": "metrics_in"
+        }
+    ],
+    "log": {
+        "loglevel": "warning"
+    },
+    "metrics": {
+        "tag": "metrics_out"
+    },
+    "outbounds": [
+        {
+            "mux": {
+                "concurrency": -1,
+                "enabled": false,
+                "xudpConcurrency": 8,
+                "xudpProxyUDP443": ""
+            },
+            "protocol": "vless",
+            "settings": {
+                "vnext": [
+                    {
+                        "address": "gr.lavivas.org",
+                        "port": 443,
+                        "users": [
+                            {
+                                "encryption": "none",
+                                "flow": "xtls-rprx-vision",
+                                "id": "291f8c54-9be0-42f2-ad88-835d1afa1434",
+                                "level": 8,
+                                "security": "auto"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "realitySettings": {
+                    "allowInsecure": false,
+                    "fingerprint": "",
+                    "publicKey": "kUmxC5Ikr0RnWvhpKrhhg9J7m6wmGVyqEYDPbsQqCmY",
+                    "serverName": "gr.lavivas.org",
+                    "shortId": "",
+                    "show": false,
+                    "spiderX": "/"
+                },
+                "security": "reality",
+                "tcpSettings": {
+                    "header": {
+                        "type": "none"
+                    }
+                }
+            },
+            "tag": "proxy"
+        },
+        {
+            "protocol": "freedom",
+            "settings": {
+                "domainStrategy": "UseIP"
+            },
+            "tag": "direct"
+        },
+        {
+            "protocol": "blackhole",
+            "settings": {
+                "response": {
+                    "type": "http"
+                }
+            },
+            "tag": "block"
+        }
+    ],
+    "policy": {
+        "levels": {
+            "0": {
+                "statsUserDownlink": true,
+                "statsUserUplink": true
+            },
+            "8": {
+                "connIdle": 300,
+                "downlinkOnly": 1,
+                "handshake": 4,
+                "uplinkOnly": 1
+            }
+        },
+        "system": {
+            "statsInboundDownlink": true,
+            "statsInboundUplink": true,
+            "statsOutboundDownlink": true,
+            "statsOutboundUplink": true
+        }
+    },
+    "remarks": "🇩🇪 Германия",
+    "routing": {
+        "domainStrategy": "IPIfNonMatch",
+        "rules": [
+            {
+                "ip": [
+                    "94.140.14.14"
+                ],
+                "outboundTag": "proxy",
+                "port": 53
+            },
+            {
+                "ip": [
+                    "94.140.15.15"
+                ],
+                "outboundTag": "direct",
+                "port": 53
+            },
+            {
+                "inboundTag": [
+                    "metrics_in"
+                ],
+                "outboundTag": "metrics_out"
+            },
+            {
+                "domain": [
+                    "geosite:private",
+                    "geosite:category-ru",
+                    "geosite:apple",
+                    "geosite:twitch"
+                ],
+                "outboundTag": "direct"
+            },
+            {
+                "ip": [
+                    "geoip:ru",
+                    "geoip:private"
+                ],
+                "outboundTag": "direct"
+            },
+            {
+                "domain": [
+                    "geosite:youtube",
+                    "geosite:category-ban-ru"
+                ],
+                "outboundTag": "proxy"
+            }
+        ]
+    },
+    "stats": {
+    }
+}

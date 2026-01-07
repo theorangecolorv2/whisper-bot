@@ -1,0 +1,19 @@
+services:
+  xray:
+    image: ghcr.io/xtls/xray-core:latest
+    restart: unless-stopped
+    volumes:
+      - ./xray/config.json:/etc/xray/config.json:ro
+    # Порт не пробрасываем наружу - только для внутренней сети Docker
+
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Бот будет использовать xray как HTTP прокси
+      # Имя "xray" - это имя сервиса в docker-compose, Docker DNS его резолвит
+      - HTTP_PROXY=http://xray:10809
+    depends_on:
+      - xray
