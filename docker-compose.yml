@@ -3,7 +3,9 @@ services:
     image: ghcr.io/xtls/xray-core:latest
     restart: unless-stopped
     volumes:
-      - ./xray/config.json:/etc/xray/config.json:ro
+      - ./xray/config.json:/config.json:ro
+    # Явно указываем путь к конфигу
+    command: ["run", "-c", "/config.json"]
     # Порт не пробрасываем наружу - только для внутренней сети Docker
 
   bot:
