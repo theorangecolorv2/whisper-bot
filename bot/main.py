@@ -17,9 +17,13 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 HTTP_PROXY = os.getenv("HTTP_PROXY")  # Прокси для Groq (опционально)
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # ID канала для проверки подписки (например @channel или -100123456)
 
 if not BOT_TOKEN or not GROQ_API_KEY:
     raise ValueError("BOT_TOKEN and GROQ_API_KEY must be set")
+
+if not CHANNEL_ID:
+    raise ValueError("CHANNEL_ID must be set")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -39,6 +43,49 @@ LLM_MODEL = "llama-3.3-70b-versatile"
 # Хранилище расшифровок: {message_id: text}
 # Нужно чтобы при нажатии кнопки знать какой текст обрабатывать
 transcriptions: dict[int, str] = {}
+
+
+async def check_subscription(user_id: int) -> bool:
+    """
+    Проверяет подписан ли пользователь на канал.
+
+    Использует bot.get_chat_member() для получения статуса пользователя.
+    Подписанными считаются: creator, administrator, member.
+    """
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        # Статусы подписанных пользователей
+        return member.status in ["creator", "administrator", "member"]
+    except Exception as e:
+        logger.exception("Error checking subscription")
+        return False
+
+
+def build_subscribe_keyboard() -> InlineKeyboardMarkup:
+    """
+    Создает клавиатуру с кнопками подписки на канал.
+    Две кнопки: ссылка на канал и проверка подписки.
+    """
+    buttons = [
+        [InlineKeyboardButton(text="Подписаться на канал", url=f"https://t.me/{CHANNEL_ID.lstrip('@')}")],
+        [InlineKeyboardButton(text="Я подписался", callback_data="check_sub")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def require_subscription(message: Message) -> bool:
+    """
+    Проверяет подписку и отправляет сообщение если не подписан.
+    Возвращает True если подписан, False если нет.
+    """
+    if await check_subscription(message.from_user.id):
+        return True
+
+    await message.answer(
+        "Для использования бота необходимо подписаться на канал.",
+        reply_markup=build_subscribe_keyboard()
+    )
+    return False
 
 
 def detect_language(text: str) -> str:
@@ -133,6 +180,10 @@ async def translate_text(text: str, target_lang: str) -> str:
 @dp.message(F.content_type == "voice")
 async def handle_voice(message: Message) -> None:
     """Handle voice messages and transcribe them using Whisper."""
+    # Проверяем подписку перед обработкой
+    if not await require_subscription(message):
+        return
+
     # Отправляем сообщение и сохраняем его, чтобы потом отредактировать
     status_msg = await message.answer("Расшифровываю...")
 
@@ -181,6 +232,10 @@ async def handle_voice(message: Message) -> None:
 @dp.message(F.content_type == "audio")
 async def handle_audio(message: Message) -> None:
     """Handle audio files."""
+    # Проверяем подписку перед обработкой
+    if not await require_subscription(message):
+        return
+
     status_msg = await message.answer("Расшифровываю аудио...")
 
     try:
@@ -300,9 +355,27 @@ async def handle_translate_callback(callback: CallbackQuery) -> None:
         await callback.message.answer(f"Ошибка при переводе: {e}")
 
 
+@dp.callback_query(F.data == "check_sub")
+async def handle_check_subscription(callback: CallbackQuery) -> None:
+    """
+    Обработчик кнопки 'Я подписался'.
+    Проверяет подписку и сообщает результат.
+    """
+    if await check_subscription(callback.from_user.id):
+        await callback.answer("Спасибо за подписку!", show_alert=True)
+        # Удаляем сообщение с просьбой подписаться
+        await callback.message.delete()
+    else:
+        await callback.answer("Вы еще не подписались на канал.", show_alert=True)
+
+
 @dp.message(F.text == "/start")
 async def handle_start(message: Message) -> None:
     """Handle /start command."""
+    # Проверяем подписку при старте
+    if not await require_subscription(message):
+        return
+
     await message.answer(
         "Привет! Отправь мне голосовое сообщение, и я расшифрую его в текст."
     )
