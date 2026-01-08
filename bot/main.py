@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@ClevVPN")
 
 if not BOT_TOKEN or not GROQ_API_KEY:
     raise ValueError("BOT_TOKEN and GROQ_API_KEY must be set")
@@ -410,11 +411,11 @@ async def handle_translate_callback(callback: CallbackQuery) -> None:
 async def handle_start(message: Message) -> None:
     """Handle /start command."""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📎 Канал", url="https://t.me/your_channel")],
+        [InlineKeyboardButton(text="📎 Канал", url="https://t.me/ClevVPN")],
         [InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]
     ])
     await message.answer(
-        "Для использования бота необходимо подписаться на [канал](https://t.me/your_channel)\n\n"
+        "Для использования бота необходимо подписаться на [канал](https://t.me/ClevVPN)\n\n"
         "После подписки нажмите кнопку проверить:",
         parse_mode="Markdown",
         reply_markup=keyboard
@@ -424,10 +425,22 @@ async def handle_start(message: Message) -> None:
 @dp.callback_query(F.data == "check_sub")
 async def handle_check_sub(callback: CallbackQuery) -> None:
     """Handle subscription check button."""
-    await callback.answer()
-    await callback.message.answer(
-        "Спасибо за подписку! Теперь отправьте мне голосовое сообщение, и я расшифрую его в текст."
-    )
+    if not CHANNEL_ID:
+        await callback.answer("Канал не настроен", show_alert=True)
+        return
+
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=callback.from_user.id)
+        if member.status in ["creator", "administrator", "member"]:
+            await callback.answer("✅ Подписка подтверждена!", show_alert=True)
+            await callback.message.answer(
+                "Спасибо за подписку! Теперь отправьте мне голосовое сообщение, и я расшифрую его в текст."
+            )
+        else:
+            await callback.answer("❌ Вы не подписаны на канал!", show_alert=True)
+    except Exception as e:
+        logger.exception("Error checking subscription")
+        await callback.answer("Ошибка проверки подписки", show_alert=True)
 
 
 @dp.message()
