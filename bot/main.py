@@ -15,9 +15,13 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+REQUIRED_CHANNEL_ID = os.getenv("REQUIRED_CHANNEL_ID")  # например: @channel_username или -1001234567890
 
 if not BOT_TOKEN or not GROQ_API_KEY:
     raise ValueError("BOT_TOKEN and GROQ_API_KEY must be set")
+
+if not REQUIRED_CHANNEL_ID:
+    raise ValueError("REQUIRED_CHANNEL_ID must be set")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -30,8 +34,38 @@ LLM_MODEL = "llama-3.3-70b-versatile"
 # Нужно чтобы при нажатии кнопки знать какой текст обрабатывать
 transcriptions: dict[int, str] = {}
 
-
 MAX_MESSAGE_LENGTH = 4000  # Оставляем запас от лимита 4096
+MIN_WORDS_FOR_SUMMARY = 50  # Минимум слов для показа кнопки пересказа
+
+
+async def check_subscription(user_id: int) -> bool:
+    """
+    Проверяет, подписан ли пользователь на обязательный канал.
+    Возвращает True если подписан, False если нет.
+    """
+    try:
+        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL_ID, user_id=user_id)
+        # Статусы: creator, administrator, member - подписан
+        # left, kicked - не подписан
+        return member.status in ["creator", "administrator", "member"]
+    except Exception as e:
+        logger.error(f"Error checking subscription for user {user_id}: {e}")
+        return False
+
+
+def get_subscription_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура с кнопкой подписки на канал."""
+    channel_link = REQUIRED_CHANNEL_ID if REQUIRED_CHANNEL_ID.startswith("@") else f"https://t.me/c/{str(REQUIRED_CHANNEL_ID).replace('-100', '')}"
+    buttons = [
+        [InlineKeyboardButton(text="Подписаться на канал", url=f"https://t.me/{REQUIRED_CHANNEL_ID.lstrip('@')}")],
+        [InlineKeyboardButton(text="Я подписался", callback_data="check_subscription")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def count_words(text: str) -> int:
+    """Считает количество слов в тексте."""
+    return len(text.split())
 
 
 def split_text(text: str, max_length: int = MAX_MESSAGE_LENGTH) -> list[str]:
@@ -109,6 +143,7 @@ def build_keyboard(text: str, message_id: int) -> InlineKeyboardMarkup:
     """
     Создает клавиатуру с кнопками под расшифровкой.
 
+    Кнопка пересказа показывается только если текст >= MIN_WORDS_FOR_SUMMARY слов.
     Кнопка перевода зависит от языка:
     - Русский текст -> "Перевести на английский"
     - Английский текст -> "Перевести на русский"
@@ -120,10 +155,13 @@ def build_keyboard(text: str, message_id: int) -> InlineKeyboardMarkup:
     translate_text = "Перевести на английский" if lang == 'ru' else "Перевести на русский"
     target_lang = "en" if lang == 'ru' else "ru"
 
-    buttons = [
-        [InlineKeyboardButton(text="Краткий пересказ", callback_data=f"summary:{message_id}")],
-        [InlineKeyboardButton(text=translate_text, callback_data=f"translate:{target_lang}:{message_id}")]
-    ]
+    buttons = []
+
+    # Показываем кнопку пересказа только для текстов >= 50 слов
+    if count_words(text) >= MIN_WORDS_FOR_SUMMARY:
+        buttons.append([InlineKeyboardButton(text="Краткий пересказ", callback_data=f"summary:{message_id}")])
+
+    buttons.append([InlineKeyboardButton(text=translate_text, callback_data=f"translate:{target_lang}:{message_id}")])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -177,6 +215,15 @@ async def translate_text(text: str, target_lang: str) -> str:
 @dp.message(F.content_type == "voice")
 async def handle_voice(message: Message) -> None:
     """Handle voice messages and transcribe them using Whisper."""
+    # Проверяем подписку на канал
+    if not await check_subscription(message.from_user.id):
+        await message.answer(
+            f"Для использования бота необходимо подписаться на наш канал {REQUIRED_CHANNEL_ID}\n\n"
+            "После подписки нажмите кнопку ниже:",
+            reply_markup=get_subscription_keyboard()
+        )
+        return
+
     # Отправляем сообщение и сохраняем его, чтобы потом отредактировать
     status_msg = await message.answer("Расшифровываю...")
 
@@ -247,6 +294,15 @@ async def handle_voice(message: Message) -> None:
 @dp.message(F.content_type == "audio")
 async def handle_audio(message: Message) -> None:
     """Handle audio files."""
+    # Проверяем подписку на канал
+    if not await check_subscription(message.from_user.id):
+        await message.answer(
+            f"Для использования бота необходимо подписаться на наш канал {REQUIRED_CHANNEL_ID}\n\n"
+            "После подписки нажмите кнопку ниже:",
+            reply_markup=get_subscription_keyboard()
+        )
+        return
+
     status_msg = await message.answer("Расшифровываю аудио...")
 
     try:
@@ -404,6 +460,22 @@ async def handle_translate_callback(callback: CallbackQuery) -> None:
     except Exception as e:
         logger.exception("Error translating")
         await callback.message.answer(f"Ошибка при переводе: {e}")
+
+
+@dp.callback_query(F.data == "check_subscription")
+async def handle_check_subscription(callback: CallbackQuery) -> None:
+    """
+    Обработчик нажатия кнопки 'Я подписался'.
+    Проверяет подписку и сообщает результат.
+    """
+    if await check_subscription(callback.from_user.id):
+        await callback.answer("Отлично! Теперь отправьте голосовое сообщение.")
+        await callback.message.edit_text(
+            "Спасибо за подписку! Теперь вы можете пользоваться ботом.\n\n"
+            "Отправьте мне голосовое сообщение, и я расшифрую его в текст."
+        )
+    else:
+        await callback.answer("Вы ещё не подписались на канал", show_alert=True)
 
 
 @dp.message(F.text == "/start")
