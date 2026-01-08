@@ -143,6 +143,8 @@ def build_keyboard(text: str, message_id: int) -> InlineKeyboardMarkup:
     Кнопка перевода зависит от языка:
     - Русский текст -> "Перевести на английский"
     - Английский текст -> "Перевести на русский"
+
+    Кнопка пересказа показывается только если в тексте >= 20 слов.
     """
     lang = detect_language(text)
 
@@ -151,10 +153,14 @@ def build_keyboard(text: str, message_id: int) -> InlineKeyboardMarkup:
     translate_text = "Перевести на английский" if lang == 'ru' else "Перевести на русский"
     target_lang = "en" if lang == 'ru' else "ru"
 
-    buttons = [
-        [InlineKeyboardButton(text="Краткий пересказ", callback_data=f"summary:{message_id}")],
-        [InlineKeyboardButton(text=translate_text, callback_data=f"translate:{target_lang}:{message_id}")]
-    ]
+    buttons = []
+
+    # Кнопка пересказа только для текстов с 20+ слов
+    word_count = len(text.split())
+    if word_count >= 20:
+        buttons.append([InlineKeyboardButton(text="Краткий пересказ", callback_data=f"summary:{message_id}")])
+
+    buttons.append([InlineKeyboardButton(text=translate_text, callback_data=f"translate:{target_lang}:{message_id}")])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
