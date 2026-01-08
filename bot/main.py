@@ -493,7 +493,7 @@ async def handle_check_sub(callback: CallbackQuery) -> None:
 async def handle_unknown(message: Message) -> None:
     """Handle all other messages."""
     await message.answer(
-        "Я понимаю только голосовые сообщения и команду /start, извините."
+        "Я понимаю только голосовые сообщения и команду /start. Пришлите мне голосовое сообщение и я его расшифрую."
     )
 
 
