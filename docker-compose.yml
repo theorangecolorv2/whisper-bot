@@ -17,5 +17,6 @@ services:
       # Бот будет использовать xray как HTTP прокси
       # Имя "xray" - это имя сервиса в docker-compose, Docker DNS его резолвит
       - HTTP_PROXY=http://xray:10809
+      - HTTPS_PROXY=http://xray:10809
     depends_on:
       - xray
