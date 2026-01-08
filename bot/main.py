@@ -106,6 +106,36 @@ def detect_language(text: str) -> str:
     return 'ru' if cyrillic_ratio >= 0.3 else 'en'
 
 
+async def check_subscription(user_id: int) -> bool:
+    """
+    Проверяет, подписан ли пользователь на канал.
+    Возвращает True если подписан, False если нет.
+    """
+    if not CHANNEL_ID:
+        return True  # Если канал не настроен, пропускаем проверку
+
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        return member.status in ["creator", "administrator", "member"]
+    except Exception as e:
+        logger.exception("Error checking subscription")
+        return False
+
+
+async def send_subscription_required(message: Message) -> None:
+    """Отправляет сообщение о необходимости подписки."""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📎 Подписаться на канал", url="https://t.me/ClevVPN")],
+        [InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]
+    ])
+    await message.answer(
+        "❌ Для использования бота необходимо подписаться на [канал](https://t.me/ClevVPN)\n\n"
+        "После подписки нажмите кнопку проверить:",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+
 def build_keyboard(text: str, message_id: int) -> InlineKeyboardMarkup:
     """
     Создает клавиатуру с кнопками под расшифровкой.
@@ -178,6 +208,11 @@ async def translate_text(text: str, target_lang: str) -> str:
 @dp.message(F.content_type == "voice")
 async def handle_voice(message: Message) -> None:
     """Handle voice messages and transcribe them using Whisper."""
+    # Проверяем подписку на канал
+    if not await check_subscription(message.from_user.id):
+        await send_subscription_required(message)
+        return
+
     # Отправляем сообщение и сохраняем его, чтобы потом отредактировать
     status_msg = await message.answer("Расшифровываю...")
 
@@ -248,6 +283,11 @@ async def handle_voice(message: Message) -> None:
 @dp.message(F.content_type == "audio")
 async def handle_audio(message: Message) -> None:
     """Handle audio files."""
+    # Проверяем подписку на канал
+    if not await check_subscription(message.from_user.id):
+        await send_subscription_required(message)
+        return
+
     status_msg = await message.answer("Расшифровываю аудио...")
 
     try:
