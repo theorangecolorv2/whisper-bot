@@ -3,7 +3,6 @@ import tempfile
 import logging
 import re
 
-import httpx
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from groq import Groq
@@ -16,26 +15,13 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-HTTP_PROXY = os.getenv("HTTP_PROXY")  # Прокси для Groq (опционально)
-CHANNEL_ID = os.getenv("CHANNEL_ID")  # ID канала для проверки подписки (например @channel или -100123456)
 
 if not BOT_TOKEN or not GROQ_API_KEY:
     raise ValueError("BOT_TOKEN and GROQ_API_KEY must be set")
 
-if not CHANNEL_ID:
-    raise ValueError("CHANNEL_ID must be set")
-
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
-# Настраиваем Groq клиент с прокси если он указан
-# httpx.Client используется Groq под капотом для HTTP запросов
-if HTTP_PROXY:
-    logger.info(f"Using HTTP proxy: {HTTP_PROXY}")
-    http_client = httpx.Client(proxy=HTTP_PROXY)
-    groq_client = Groq(api_key=GROQ_API_KEY, http_client=http_client)
-else:
-    groq_client = Groq(api_key=GROQ_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 # Модель для пересказа и перевода
 LLM_MODEL = "llama-3.3-70b-versatile"
@@ -45,47 +31,58 @@ LLM_MODEL = "llama-3.3-70b-versatile"
 transcriptions: dict[int, str] = {}
 
 
-async def check_subscription(user_id: int) -> bool:
-    """
-    Проверяет подписан ли пользователь на канал.
-
-    Использует bot.get_chat_member() для получения статуса пользователя.
-    Подписанными считаются: creator, administrator, member.
-    """
-    try:
-        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-        # Статусы подписанных пользователей
-        return member.status in ["creator", "administrator", "member"]
-    except Exception as e:
-        logger.exception("Error checking subscription")
-        return False
+MAX_MESSAGE_LENGTH = 4000  # Оставляем запас от лимита 4096
 
 
-def build_subscribe_keyboard() -> InlineKeyboardMarkup:
+def split_text(text: str, max_length: int = MAX_MESSAGE_LENGTH) -> list[str]:
     """
-    Создает клавиатуру с кнопками подписки на канал.
-    Две кнопки: ссылка на канал и проверка подписки.
+    Разбивает длинный текст на части, не превышающие max_length.
+    Старается разбивать по абзацам, затем по предложениям, затем по словам.
     """
-    buttons = [
-        [InlineKeyboardButton(text="Подписаться на канал", url=f"https://t.me/{CHANNEL_ID.lstrip('@')}")],
-        [InlineKeyboardButton(text="Я подписался", callback_data="check_sub")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    if len(text) <= max_length:
+        return [text]
 
+    parts = []
+    current_part = ""
 
-async def require_subscription(message: Message) -> bool:
-    """
-    Проверяет подписку и отправляет сообщение если не подписан.
-    Возвращает True если подписан, False если нет.
-    """
-    if await check_subscription(message.from_user.id):
-        return True
+    # Разбиваем по абзацам
+    paragraphs = text.split('\n\n')
 
-    await message.answer(
-        "Для использования бота необходимо подписаться на канал.",
-        reply_markup=build_subscribe_keyboard()
-    )
-    return False
+    for paragraph in paragraphs:
+        # Если абзац сам по себе слишком длинный
+        if len(paragraph) > max_length:
+            # Сначала добавляем то что накопили
+            if current_part:
+                parts.append(current_part.strip())
+                current_part = ""
+
+            # Разбиваем длинный абзац по предложениям
+            sentences = re.split(r'(?<=[.!?])\s+', paragraph)
+            for sentence in sentences:
+                if len(sentence) > max_length:
+                    # Даже предложение слишком длинное - режем по словам
+                    words = sentence.split()
+                    for word in words:
+                        if len(current_part) + len(word) + 1 > max_length:
+                            parts.append(current_part.strip())
+                            current_part = word
+                        else:
+                            current_part += " " + word if current_part else word
+                elif len(current_part) + len(sentence) + 1 > max_length:
+                    parts.append(current_part.strip())
+                    current_part = sentence
+                else:
+                    current_part += " " + sentence if current_part else sentence
+        elif len(current_part) + len(paragraph) + 2 > max_length:
+            parts.append(current_part.strip())
+            current_part = paragraph
+        else:
+            current_part += "\n\n" + paragraph if current_part else paragraph
+
+    if current_part.strip():
+        parts.append(current_part.strip())
+
+    return parts
 
 
 def detect_language(text: str) -> str:
@@ -180,10 +177,6 @@ async def translate_text(text: str, target_lang: str) -> str:
 @dp.message(F.content_type == "voice")
 async def handle_voice(message: Message) -> None:
     """Handle voice messages and transcribe them using Whisper."""
-    # Проверяем подписку перед обработкой
-    if not await require_subscription(message):
-        return
-
     # Отправляем сообщение и сохраняем его, чтобы потом отредактировать
     status_msg = await message.answer("Расшифровываю...")
 
@@ -210,15 +203,37 @@ async def handle_voice(message: Message) -> None:
                 # Сохраняем текст для последующих действий (пересказ/перевод)
                 transcriptions[status_msg.message_id] = text
 
-                # Создаем клавиатуру с кнопками
-                keyboard = build_keyboard(text, status_msg.message_id)
+                # Разбиваем текст на части если он слишком длинный
+                parts = split_text(text)
 
-                # Редактируем сообщение вместо отправки нового
-                await status_msg.edit_text(
-                    f"**Расшифровка:**\n\n{text}",
-                    parse_mode="Markdown",
-                    reply_markup=keyboard
-                )
+                if len(parts) == 1:
+                    # Текст умещается в одно сообщение
+                    keyboard = build_keyboard(text, status_msg.message_id)
+                    await status_msg.edit_text(
+                        f"**Расшифровка:**\n\n{text}",
+                        parse_mode="Markdown",
+                        reply_markup=keyboard
+                    )
+                else:
+                    # Текст слишком длинный - отправляем частями
+                    await status_msg.edit_text(
+                        f"**Расшифровка (часть 1/{len(parts)}):**\n\n{parts[0]}",
+                        parse_mode="Markdown"
+                    )
+                    for i, part in enumerate(parts[1:], start=2):
+                        if i == len(parts):
+                            # Последняя часть - с кнопками
+                            keyboard = build_keyboard(text, status_msg.message_id)
+                            await message.answer(
+                                f"**Часть {i}/{len(parts)}:**\n\n{part}",
+                                parse_mode="Markdown",
+                                reply_markup=keyboard
+                            )
+                        else:
+                            await message.answer(
+                                f"**Часть {i}/{len(parts)}:**\n\n{part}",
+                                parse_mode="Markdown"
+                            )
             else:
                 await status_msg.edit_text("Не удалось распознать речь.")
         finally:
@@ -232,10 +247,6 @@ async def handle_voice(message: Message) -> None:
 @dp.message(F.content_type == "audio")
 async def handle_audio(message: Message) -> None:
     """Handle audio files."""
-    # Проверяем подписку перед обработкой
-    if not await require_subscription(message):
-        return
-
     status_msg = await message.answer("Расшифровываю аудио...")
 
     try:
@@ -264,15 +275,37 @@ async def handle_audio(message: Message) -> None:
                 # Сохраняем текст для последующих действий
                 transcriptions[status_msg.message_id] = text
 
-                # Создаем клавиатуру с кнопками
-                keyboard = build_keyboard(text, status_msg.message_id)
+                # Разбиваем текст на части если он слишком длинный
+                parts = split_text(text)
 
-                # Редактируем сообщение вместо отправки нового
-                await status_msg.edit_text(
-                    f"**Расшифровка:**\n\n{text}",
-                    parse_mode="Markdown",
-                    reply_markup=keyboard
-                )
+                if len(parts) == 1:
+                    # Текст умещается в одно сообщение
+                    keyboard = build_keyboard(text, status_msg.message_id)
+                    await status_msg.edit_text(
+                        f"**Расшифровка:**\n\n{text}",
+                        parse_mode="Markdown",
+                        reply_markup=keyboard
+                    )
+                else:
+                    # Текст слишком длинный - отправляем частями
+                    await status_msg.edit_text(
+                        f"**Расшифровка (часть 1/{len(parts)}):**\n\n{parts[0]}",
+                        parse_mode="Markdown"
+                    )
+                    for i, part in enumerate(parts[1:], start=2):
+                        if i == len(parts):
+                            # Последняя часть - с кнопками
+                            keyboard = build_keyboard(text, status_msg.message_id)
+                            await message.answer(
+                                f"**Часть {i}/{len(parts)}:**\n\n{part}",
+                                parse_mode="Markdown",
+                                reply_markup=keyboard
+                            )
+                        else:
+                            await message.answer(
+                                f"**Часть {i}/{len(parts)}:**\n\n{part}",
+                                parse_mode="Markdown"
+                            )
             else:
                 await status_msg.edit_text("Не удалось распознать речь.")
         finally:
@@ -307,11 +340,20 @@ async def handle_summary_callback(callback: CallbackQuery) -> None:
         # Делаем пересказ через LLM
         summary = await summarize_text(text)
 
-        # Отправляем пересказ отдельным сообщением (не редактируем оригинал)
-        await callback.message.answer(
-            f"**Краткий пересказ:**\n\n{summary}",
-            parse_mode="Markdown"
-        )
+        # Разбиваем на части если пересказ длинный
+        parts = split_text(summary)
+
+        for i, part in enumerate(parts, start=1):
+            if len(parts) == 1:
+                await callback.message.answer(
+                    f"**Краткий пересказ:**\n\n{part}",
+                    parse_mode="Markdown"
+                )
+            else:
+                await callback.message.answer(
+                    f"**Краткий пересказ (часть {i}/{len(parts)}):**\n\n{part}",
+                    parse_mode="Markdown"
+                )
 
     except Exception as e:
         logger.exception("Error creating summary")
@@ -343,39 +385,30 @@ async def handle_translate_callback(callback: CallbackQuery) -> None:
         # Переводим через LLM
         translation = await translate_text(text, target_lang)
 
-        # Отправляем перевод отдельным сообщением
+        # Разбиваем на части если перевод длинный
+        parts = split_text(translation)
         lang_label = "русский" if target_lang == "ru" else "английский"
-        await callback.message.answer(
-            f"**Перевод на {lang_label}:**\n\n{translation}",
-            parse_mode="Markdown"
-        )
+
+        for i, part in enumerate(parts, start=1):
+            if len(parts) == 1:
+                await callback.message.answer(
+                    f"**Перевод на {lang_label}:**\n\n{part}",
+                    parse_mode="Markdown"
+                )
+            else:
+                await callback.message.answer(
+                    f"**Перевод на {lang_label} (часть {i}/{len(parts)}):**\n\n{part}",
+                    parse_mode="Markdown"
+                )
 
     except Exception as e:
         logger.exception("Error translating")
         await callback.message.answer(f"Ошибка при переводе: {e}")
 
 
-@dp.callback_query(F.data == "check_sub")
-async def handle_check_subscription(callback: CallbackQuery) -> None:
-    """
-    Обработчик кнопки 'Я подписался'.
-    Проверяет подписку и сообщает результат.
-    """
-    if await check_subscription(callback.from_user.id):
-        await callback.answer("Спасибо за подписку!", show_alert=True)
-        # Удаляем сообщение с просьбой подписаться
-        await callback.message.delete()
-    else:
-        await callback.answer("Вы еще не подписались на канал.", show_alert=True)
-
-
 @dp.message(F.text == "/start")
 async def handle_start(message: Message) -> None:
     """Handle /start command."""
-    # Проверяем подписку при старте
-    if not await require_subscription(message):
-        return
-
     await message.answer(
         "Привет! Отправь мне голосовое сообщение, и я расшифрую его в текст."
     )
