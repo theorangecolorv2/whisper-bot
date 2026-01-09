@@ -456,16 +456,26 @@ async def handle_translate_callback(callback: CallbackQuery) -> None:
 @dp.message(F.text == "/start")
 async def handle_start(message: Message) -> None:
     """Handle /start command."""
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📎 Канал", url="https://t.me/ClevVPN")],
-        [InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]
-    ])
-    await message.answer(
-        "Для использования бота необходимо подписаться на [канал](https://t.me/ClevVPN)\n\n"
-        "После подписки нажмите кнопку проверить:",
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
+    # Проверяем подписку
+    if await check_subscription(message.from_user.id):
+        # Пользователь подписан - показываем приветственное сообщение
+        await message.answer(
+            "Привет! Я бот для расшифровки голосовых сообщений.\n\n"
+            "Отправьте мне голосовое сообщение или аудиофайл, и я расшифрую его в текст.\n\n"
+            "Также я могу сделать краткий пересказ или перевести текст."
+        )
+    else:
+        # Пользователь не подписан - показываем сообщение о необходимости подписки
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📎 Канал", url="https://t.me/ClevVPN")],
+            [InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]
+        ])
+        await message.answer(
+            "Для использования бота необходимо подписаться на [канал](https://t.me/ClevVPN)\n\n"
+            "После подписки нажмите кнопку проверить:",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
 
 
 @dp.callback_query(F.data == "check_sub")
