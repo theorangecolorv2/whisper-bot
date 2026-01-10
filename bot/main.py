@@ -3,6 +3,7 @@ import tempfile
 import logging
 import re
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from groq import Groq
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@ClevVPN")
+CLEVVPN_API_URL = os.getenv("CLEVVPN_API_URL", "http://89.111.143.90:8080")
 
 if not BOT_TOKEN or not GROQ_API_KEY:
     raise ValueError("BOT_TOKEN and GROQ_API_KEY must be set")
@@ -106,7 +108,7 @@ def detect_language(text: str) -> str:
     return 'ru' if cyrillic_ratio >= 0.3 else 'en'
 
 
-async def check_subscription(user_id: int) -> bool:
+async def check_channel_subscription(user_id: int) -> bool:
     """
     Проверяет, подписан ли пользователь на канал.
     Возвращает True если подписан, False если нет.
@@ -117,23 +119,61 @@ async def check_subscription(user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
         return member.status in ["creator", "administrator", "member"]
-    except Exception as e:
+    except Exception:
         logger.exception("Error checking subscription")
         return False
 
 
-async def send_subscription_required(message: Message) -> None:
-    """Отправляет сообщение о необходимости подписки."""
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📎 Подписаться на канал", url="https://t.me/ClevVPN")],
-        [InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]
-    ])
-    await message.answer(
-        "❌ Для использования бота необходимо подписаться на [канал](https://t.me/ClevVPN)\n\n"
-        "После подписки нажмите кнопку проверить:",
-        parse_mode="Markdown",
-        reply_markup=keyboard
+async def check_clevvpn_bot_started(user_id: int) -> bool:
+    if not CLEVVPN_API_URL:
+        return True
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CLEVVPN_API_URL}/api/user/exists",
+                params={"telegram_id": user_id},
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("exists", False)
+                return False
+    except Exception:
+        logger.exception("Error checking ClevVPN bot started")
+        return False
+
+
+async def check_all_requirements(user_id: int) -> tuple[bool, bool]:
+    channel_ok = await check_channel_subscription(user_id)
+    bot_ok = await check_clevvpn_bot_started(user_id)
+    return channel_ok, bot_ok
+
+
+def get_requirements_message(channel_ok: bool, bot_ok: bool) -> str:
+    step1 = "✅" if channel_ok else "❌"
+    step2 = "✅" if bot_ok else "❌"
+    return (
+        "Чтобы бот всегда оставался бесплатным и работал стабильно, "
+        "необходимо выполнить два пункта:\n\n"
+        f"{step1} Шаг 1: Подпишитесь на наш [канал](https://t.me/ClevVPN)\n\n"
+        f"{step2} Шаг 2: Зайдите в [бота](https://t.me/ClevVPN_bot) и нажмите «Старт»\n\n"
+        "И всё — вы в деле! Спасибо, что вы с нами! ❤️"
     )
+
+
+def get_requirements_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Канал", url="https://t.me/ClevVPN")],
+        [InlineKeyboardButton(text="🤖 Бот ClevVPN", url="https://t.me/ClevVPN_bot")],
+        [InlineKeyboardButton(text="🔄 Проверить", callback_data="check_requirements")]
+    ])
+
+
+async def send_requirements_message(message: Message) -> None:
+    channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
+    text = get_requirements_message(channel_ok, bot_ok)
+    keyboard = get_requirements_keyboard()
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
 
 
 def build_keyboard(text: str, message_id: int) -> InlineKeyboardMarkup:
@@ -214,9 +254,10 @@ async def translate_text(text: str, target_lang: str) -> str:
 @dp.message(F.content_type == "voice")
 async def handle_voice(message: Message) -> None:
     """Handle voice messages and transcribe them using Whisper."""
-    # Проверяем подписку на канал
-    if not await check_subscription(message.from_user.id):
-        await send_subscription_required(message)
+    # Проверяем все требования
+    channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
+    if not channel_ok or not bot_ok:
+        await send_requirements_message(message)
         return
 
     # Отправляем сообщение и сохраняем его, чтобы потом отредактировать
@@ -289,9 +330,10 @@ async def handle_voice(message: Message) -> None:
 @dp.message(F.content_type == "audio")
 async def handle_audio(message: Message) -> None:
     """Handle audio files."""
-    # Проверяем подписку на канал
-    if not await check_subscription(message.from_user.id):
-        await send_subscription_required(message)
+    # Проверяем все требования
+    channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
+    if not channel_ok or not bot_ok:
+        await send_requirements_message(message)
         return
 
     status_msg = await message.answer("Расшифровываю аудио...")
@@ -456,47 +498,39 @@ async def handle_translate_callback(callback: CallbackQuery) -> None:
 @dp.message(F.text == "/start")
 async def handle_start(message: Message) -> None:
     """Handle /start command."""
-    # Проверяем подписку
-    if await check_subscription(message.from_user.id):
-        # Пользователь подписан - показываем приветственное сообщение
-        await message.answer(
-            "Привет! Я бот для расшифровки голосовых сообщений.\n\n"
-            "Отправьте мне голосовое сообщение или аудиофайл, и я расшифрую его в текст.\n\n"
-            "Также я могу сделать краткий пересказ или перевести текст."
-        )
-    else:
-        # Пользователь не подписан - показываем сообщение о необходимости подписки
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📎 Канал", url="https://t.me/ClevVPN")],
-            [InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]
-        ])
-        await message.answer(
-            "Для использования бота необходимо подписаться на [канал](https://t.me/ClevVPN)\n\n"
-            "После подписки нажмите кнопку проверить:",
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-
-
-@dp.callback_query(F.data == "check_sub")
-async def handle_check_sub(callback: CallbackQuery) -> None:
-    """Handle subscription check button."""
-    if not CHANNEL_ID:
-        await callback.answer("Канал не настроен", show_alert=True)
+    # Проверяем все требования
+    channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
+    if not channel_ok or not bot_ok:
+        await send_requirements_message(message)
         return
 
-    try:
-        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=callback.from_user.id)
-        if member.status in ["creator", "administrator", "member"]:
-            await callback.answer("✅ Подписка подтверждена!", show_alert=True)
-            await callback.message.answer(
-                "Спасибо за подписку! Теперь отправьте мне голосовое сообщение, и я расшифрую его в текст."
-            )
+    # Все требования выполнены - показываем приветственное сообщение
+    await message.answer(
+        "Привет! Я бот для расшифровки голосовых сообщений.\n\n"
+        "Отправьте мне голосовое сообщение или аудиофайл, и я расшифрую его в текст.\n\n"
+        "Также я могу сделать краткий пересказ или перевести текст."
+    )
+
+
+@dp.callback_query(F.data == "check_requirements")
+async def handle_check_requirements(callback: CallbackQuery) -> None:
+    channel_ok, bot_ok = await check_all_requirements(callback.from_user.id)
+    if channel_ok and bot_ok:
+        await callback.answer("✅ Все условия выполнены!", show_alert=True)
+        await callback.message.answer("Спасибо! Теперь отправьте мне голосовое сообщение, и я расшифрую его в текст.")
+    else:
+        text = get_requirements_message(channel_ok, bot_ok)
+        keyboard = get_requirements_keyboard()
+        if not channel_ok and not bot_ok:
+            await callback.answer("❌ Выполните оба шага!", show_alert=True)
+        elif not channel_ok:
+            await callback.answer("❌ Подпишитесь на канал!", show_alert=True)
         else:
-            await callback.answer("❌ Вы не подписаны на канал!", show_alert=True)
-    except Exception as e:
-        logger.exception("Error checking subscription")
-        await callback.answer("Ошибка проверки подписки", show_alert=True)
+            await callback.answer("❌ Нажмите /start в боте ClevVPN!", show_alert=True)
+        try:
+            await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        except Exception:
+            pass
 
 
 @dp.message()
