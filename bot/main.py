@@ -2,10 +2,13 @@ import os
 import tempfile
 import logging
 import re
+import asyncio
+import subprocess
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramBadRequest
 from groq import Groq
 from dotenv import load_dotenv
 
@@ -26,12 +29,128 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Модель для пересказа и перевода
-LLM_MODEL = "llama-3.3-70b-versatile"
+# Модель для пересказа, перевода и пунктуации
+LLM_MODEL = "openai/gpt-oss-120b"
 
 # Хранилище расшифровок: {message_id: text}
 # Нужно чтобы при нажатии кнопки знать какой текст обрабатывать
 transcriptions: dict[int, str] = {}
+
+# Настройки retry
+MAX_RETRIES = 3
+RETRY_DELAYS = [1, 2, 3]  # секунды между попытками
+
+
+async def safe_send_message(
+    target: Message | CallbackQuery,
+    text: str,
+    parse_mode: str | None = "Markdown",
+    reply_markup: InlineKeyboardMarkup | None = None
+) -> Message | None:
+    """
+    Безопасная отправка сообщения с retry логикой.
+
+    При ошибке парсинга Markdown - пробует без форматирования.
+    При сетевых ошибках - делает до 3 попыток с задержками.
+    """
+    message_target = target.message if isinstance(target, CallbackQuery) else target
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            return await message_target.answer(
+                text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup
+            )
+        except TelegramBadRequest as e:
+            error_text = str(e).lower()
+            # Ошибка парсинга Markdown - пробуем без форматирования
+            if "can't parse entities" in error_text or "parse entities" in error_text:
+                logger.warning(f"Markdown parse error, retrying without formatting: {e}")
+                try:
+                    return await message_target.answer(
+                        text,
+                        parse_mode=None,
+                        reply_markup=reply_markup
+                    )
+                except Exception as fallback_error:
+                    logger.error(f"Fallback send also failed: {fallback_error}")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        continue
+            else:
+                # Другая ошибка Telegram - retry
+                logger.warning(f"Telegram error (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAYS[attempt])
+                    continue
+        except Exception as e:
+            logger.warning(f"Send error (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(RETRY_DELAYS[attempt])
+                continue
+
+    # Все попытки исчерпаны
+    try:
+        return await message_target.answer(
+            "⚠️ Не удалось отправить сообщение. Попробуйте через минуту."
+        )
+    except Exception:
+        logger.error("Failed to send error message to user")
+        return None
+
+
+async def safe_edit_message(
+    message: Message,
+    text: str,
+    parse_mode: str | None = "Markdown",
+    reply_markup: InlineKeyboardMarkup | None = None
+) -> Message | bool | None:
+    """
+    Безопасное редактирование сообщения с retry логикой.
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            return await message.edit_text(
+                text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup
+            )
+        except TelegramBadRequest as e:
+            error_text = str(e).lower()
+            # Ошибка парсинга Markdown - пробуем без форматирования
+            if "can't parse entities" in error_text or "parse entities" in error_text:
+                logger.warning(f"Markdown parse error on edit, retrying without formatting: {e}")
+                try:
+                    return await message.edit_text(
+                        text,
+                        parse_mode=None,
+                        reply_markup=reply_markup
+                    )
+                except Exception as fallback_error:
+                    logger.error(f"Fallback edit also failed: {fallback_error}")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        continue
+            else:
+                logger.warning(f"Telegram edit error (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAYS[attempt])
+                    continue
+        except Exception as e:
+            logger.warning(f"Edit error (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(RETRY_DELAYS[attempt])
+                continue
+
+    # Все попытки исчерпаны
+    try:
+        return await message.edit_text(
+            "⚠️ Не удалось обновить сообщение. Попробуйте через минуту."
+        )
+    except Exception:
+        logger.error("Failed to send error message to user")
+        return None
 
 
 MAX_MESSAGE_LENGTH = 4000  # Оставляем запас от лимита 4096
@@ -251,6 +370,28 @@ async def translate_text(text: str, target_lang: str) -> str:
     return response.choices[0].message.content
 
 
+async def fix_punctuation(text: str) -> str:
+    """
+    Исправляет пунктуацию в тексте через LLM.
+    Добавляет точки, запятые, заглавные буквы где нужно.
+    """
+    response = groq_client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "Исправь пунктуацию в тексте: добавь точки, запятые, вопросительные и восклицательные знаки, заглавные буквы в начале предложений. Не меняй слова, не добавляй и не удаляй текст — только расставь знаки препинания. Выводи только исправленный текст."
+            },
+            {
+                "role": "user",
+                "content": text
+            }
+        ],
+        temperature=0.1
+    )
+    return response.choices[0].message.content
+
+
 @dp.message(F.content_type == "voice")
 async def handle_voice(message: Message) -> None:
     """Handle voice messages and transcribe them using Whisper."""
@@ -281,8 +422,11 @@ async def handle_voice(message: Message) -> None:
                     model="whisper-large-v3",
                 )
 
-            text = transcription.text.strip()
-            if text:
+            raw_text = transcription.text.strip()
+            if raw_text:
+                # Исправляем пунктуацию через LLM
+                text = await fix_punctuation(raw_text)
+
                 # Сохраняем текст для последующих действий (пересказ/перевод)
                 transcriptions[status_msg.message_id] = text
 
@@ -292,30 +436,30 @@ async def handle_voice(message: Message) -> None:
                 if len(parts) == 1:
                     # Текст умещается в одно сообщение
                     keyboard = build_keyboard(text, status_msg.message_id)
-                    await status_msg.edit_text(
+                    await safe_edit_message(
+                        status_msg,
                         f"**Расшифровка:**\n\n{text}",
-                        parse_mode="Markdown",
                         reply_markup=keyboard
                     )
                 else:
                     # Текст слишком длинный - отправляем частями
-                    await status_msg.edit_text(
-                        f"**Расшифровка (часть 1/{len(parts)}):**\n\n{parts[0]}",
-                        parse_mode="Markdown"
+                    await safe_edit_message(
+                        status_msg,
+                        f"**Расшифровка (часть 1/{len(parts)}):**\n\n{parts[0]}"
                     )
                     for i, part in enumerate(parts[1:], start=2):
                         if i == len(parts):
                             # Последняя часть - с кнопками
                             keyboard = build_keyboard(text, status_msg.message_id)
-                            await message.answer(
+                            await safe_send_message(
+                                message,
                                 f"**Часть {i}/{len(parts)}:**\n\n{part}",
-                                parse_mode="Markdown",
                                 reply_markup=keyboard
                             )
                         else:
-                            await message.answer(
-                                f"**Часть {i}/{len(parts)}:**\n\n{part}",
-                                parse_mode="Markdown"
+                            await safe_send_message(
+                                message,
+                                f"**Часть {i}/{len(parts)}:**\n\n{part}"
                             )
             else:
                 await status_msg.edit_text("Не удалось распознать речь.")
@@ -324,7 +468,7 @@ async def handle_voice(message: Message) -> None:
 
     except Exception as e:
         logger.exception("Error transcribing voice message")
-        await status_msg.edit_text(f"Ошибка при расшифровке: {e}")
+        await safe_edit_message(status_msg, "⚠️ Ошибка при расшифровке. Попробуйте через минуту.", parse_mode=None)
 
 
 @dp.message(F.content_type == "audio")
@@ -359,8 +503,11 @@ async def handle_audio(message: Message) -> None:
                     model="whisper-large-v3",
                 )
 
-            text = transcription.text.strip()
-            if text:
+            raw_text = transcription.text.strip()
+            if raw_text:
+                # Исправляем пунктуацию через LLM
+                text = await fix_punctuation(raw_text)
+
                 # Сохраняем текст для последующих действий
                 transcriptions[status_msg.message_id] = text
 
@@ -370,30 +517,30 @@ async def handle_audio(message: Message) -> None:
                 if len(parts) == 1:
                     # Текст умещается в одно сообщение
                     keyboard = build_keyboard(text, status_msg.message_id)
-                    await status_msg.edit_text(
+                    await safe_edit_message(
+                        status_msg,
                         f"**Расшифровка:**\n\n{text}",
-                        parse_mode="Markdown",
                         reply_markup=keyboard
                     )
                 else:
                     # Текст слишком длинный - отправляем частями
-                    await status_msg.edit_text(
-                        f"**Расшифровка (часть 1/{len(parts)}):**\n\n{parts[0]}",
-                        parse_mode="Markdown"
+                    await safe_edit_message(
+                        status_msg,
+                        f"**Расшифровка (часть 1/{len(parts)}):**\n\n{parts[0]}"
                     )
                     for i, part in enumerate(parts[1:], start=2):
                         if i == len(parts):
                             # Последняя часть - с кнопками
                             keyboard = build_keyboard(text, status_msg.message_id)
-                            await message.answer(
+                            await safe_send_message(
+                                message,
                                 f"**Часть {i}/{len(parts)}:**\n\n{part}",
-                                parse_mode="Markdown",
                                 reply_markup=keyboard
                             )
                         else:
-                            await message.answer(
-                                f"**Часть {i}/{len(parts)}:**\n\n{part}",
-                                parse_mode="Markdown"
+                            await safe_send_message(
+                                message,
+                                f"**Часть {i}/{len(parts)}:**\n\n{part}"
                             )
             else:
                 await status_msg.edit_text("Не удалось распознать речь.")
@@ -402,7 +549,210 @@ async def handle_audio(message: Message) -> None:
 
     except Exception as e:
         logger.exception("Error transcribing audio")
-        await status_msg.edit_text(f"Ошибка при расшифровке: {e}")
+        await safe_edit_message(status_msg, "⚠️ Ошибка при расшифровке. Попробуйте через минуту.", parse_mode=None)
+
+
+@dp.message(F.content_type == "video")
+async def handle_video(message: Message) -> None:
+    """Handle video files - extract audio and transcribe."""
+    # Проверяем все требования
+    channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
+    if not channel_ok or not bot_ok:
+        await send_requirements_message(message)
+        return
+
+    status_msg = await message.answer("Извлекаю аудио из видео...")
+
+    try:
+        file = await bot.get_file(message.video.file_id)
+        file_bytes = await bot.download_file(file.file_path)
+
+        # Сохраняем видео во временный файл
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_video:
+            tmp_video.write(file_bytes.read())
+            video_path = tmp_video.name
+
+        # Путь для извлечённого аудио
+        audio_path = video_path.replace(".mp4", ".ogg")
+
+        try:
+            # Извлекаем аудио через ffmpeg
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-i", video_path,
+                    "-vn",  # без видео
+                    "-acodec", "libopus",  # кодек opus для ogg
+                    "-b:a", "64k",  # битрейт
+                    "-y",  # перезаписать если существует
+                    audio_path
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120  # таймаут 2 минуты
+            )
+
+            if result.returncode != 0:
+                logger.error(f"FFmpeg error: {result.stderr}")
+                await safe_edit_message(status_msg, "⚠️ Не удалось извлечь аудио из видео.", parse_mode=None)
+                return
+
+            await safe_edit_message(status_msg, "Расшифровываю...", parse_mode=None)
+
+            # Транскрибируем аудио
+            with open(audio_path, "rb") as audio_file:
+                transcription = groq_client.audio.transcriptions.create(
+                    file=(audio_path, audio_file.read()),
+                    model="whisper-large-v3",
+                )
+
+            raw_text = transcription.text.strip()
+            if raw_text:
+                # Исправляем пунктуацию через LLM
+                text = await fix_punctuation(raw_text)
+
+                # Сохраняем текст для последующих действий
+                transcriptions[status_msg.message_id] = text
+
+                # Разбиваем текст на части если он слишком длинный
+                parts = split_text(text)
+
+                if len(parts) == 1:
+                    keyboard = build_keyboard(text, status_msg.message_id)
+                    await safe_edit_message(
+                        status_msg,
+                        f"**Расшифровка видео:**\n\n{text}",
+                        reply_markup=keyboard
+                    )
+                else:
+                    await safe_edit_message(
+                        status_msg,
+                        f"**Расшифровка видео (часть 1/{len(parts)}):**\n\n{parts[0]}"
+                    )
+                    for i, part in enumerate(parts[1:], start=2):
+                        if i == len(parts):
+                            keyboard = build_keyboard(text, status_msg.message_id)
+                            await safe_send_message(
+                                message,
+                                f"**Часть {i}/{len(parts)}:**\n\n{part}",
+                                reply_markup=keyboard
+                            )
+                        else:
+                            await safe_send_message(
+                                message,
+                                f"**Часть {i}/{len(parts)}:**\n\n{part}"
+                            )
+            else:
+                await status_msg.edit_text("Не удалось распознать речь в видео.")
+        finally:
+            # Удаляем временные файлы
+            if os.path.exists(video_path):
+                os.unlink(video_path)
+            if os.path.exists(audio_path):
+                os.unlink(audio_path)
+
+    except Exception as e:
+        logger.exception("Error transcribing video")
+        await safe_edit_message(status_msg, "⚠️ Ошибка при расшифровке видео. Попробуйте через минуту.", parse_mode=None)
+
+
+@dp.message(F.content_type == "video_note")
+async def handle_video_note(message: Message) -> None:
+    """Handle video notes (круглые видеосообщения) - extract audio and transcribe."""
+    # Проверяем все требования
+    channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
+    if not channel_ok or not bot_ok:
+        await send_requirements_message(message)
+        return
+
+    status_msg = await message.answer("Расшифровываю видеосообщение...")
+
+    try:
+        file = await bot.get_file(message.video_note.file_id)
+        file_bytes = await bot.download_file(file.file_path)
+
+        # Сохраняем видео во временный файл
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_video:
+            tmp_video.write(file_bytes.read())
+            video_path = tmp_video.name
+
+        # Путь для извлечённого аудио
+        audio_path = video_path.replace(".mp4", ".ogg")
+
+        try:
+            # Извлекаем аудио через ffmpeg
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-i", video_path,
+                    "-vn",
+                    "-acodec", "libopus",
+                    "-b:a", "64k",
+                    "-y",
+                    audio_path
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+
+            if result.returncode != 0:
+                logger.error(f"FFmpeg error: {result.stderr}")
+                await safe_edit_message(status_msg, "⚠️ Не удалось извлечь аудио из видеосообщения.", parse_mode=None)
+                return
+
+            # Транскрибируем аудио
+            with open(audio_path, "rb") as audio_file:
+                transcription = groq_client.audio.transcriptions.create(
+                    file=(audio_path, audio_file.read()),
+                    model="whisper-large-v3",
+                )
+
+            raw_text = transcription.text.strip()
+            if raw_text:
+                # Исправляем пунктуацию через LLM
+                text = await fix_punctuation(raw_text)
+
+                # Сохраняем текст для последующих действий
+                transcriptions[status_msg.message_id] = text
+
+                # Разбиваем текст на части если он слишком длинный
+                parts = split_text(text)
+
+                if len(parts) == 1:
+                    keyboard = build_keyboard(text, status_msg.message_id)
+                    await safe_edit_message(
+                        status_msg,
+                        f"**Расшифровка:**\n\n{text}",
+                        reply_markup=keyboard
+                    )
+                else:
+                    await safe_edit_message(
+                        status_msg,
+                        f"**Расшифровка (часть 1/{len(parts)}):**\n\n{parts[0]}"
+                    )
+                    for i, part in enumerate(parts[1:], start=2):
+                        if i == len(parts):
+                            keyboard = build_keyboard(text, status_msg.message_id)
+                            await safe_send_message(
+                                message,
+                                f"**Часть {i}/{len(parts)}:**\n\n{part}",
+                                reply_markup=keyboard
+                            )
+                        else:
+                            await safe_send_message(
+                                message,
+                                f"**Часть {i}/{len(parts)}:**\n\n{part}"
+                            )
+            else:
+                await status_msg.edit_text("Не удалось распознать речь.")
+        finally:
+            if os.path.exists(video_path):
+                os.unlink(video_path)
+            if os.path.exists(audio_path):
+                os.unlink(audio_path)
+
+    except Exception as e:
+        logger.exception("Error transcribing video note")
+        await safe_edit_message(status_msg, "⚠️ Ошибка при расшифровке. Попробуйте через минуту.", parse_mode=None)
 
 
 @dp.callback_query(F.data.startswith("summary:"))
@@ -423,7 +773,7 @@ async def handle_summary_callback(callback: CallbackQuery) -> None:
         # Получаем оригинальный текст
         text = transcriptions.get(message_id)
         if not text:
-            await callback.message.answer("Текст не найден. Возможно, бот был перезапущен.")
+            await safe_send_message(callback, "Текст не найден. Возможно, бот был перезапущен.", parse_mode=None)
             return
 
         # Делаем пересказ через LLM
@@ -434,19 +784,19 @@ async def handle_summary_callback(callback: CallbackQuery) -> None:
 
         for i, part in enumerate(parts, start=1):
             if len(parts) == 1:
-                await callback.message.answer(
-                    f"**Краткий пересказ:**\n\n{part}",
-                    parse_mode="Markdown"
+                await safe_send_message(
+                    callback,
+                    f"**Краткий пересказ:**\n\n{part}"
                 )
             else:
-                await callback.message.answer(
-                    f"**Краткий пересказ (часть {i}/{len(parts)}):**\n\n{part}",
-                    parse_mode="Markdown"
+                await safe_send_message(
+                    callback,
+                    f"**Краткий пересказ (часть {i}/{len(parts)}):**\n\n{part}"
                 )
 
     except Exception as e:
         logger.exception("Error creating summary")
-        await callback.message.answer(f"Ошибка при создании пересказа: {e}")
+        await safe_send_message(callback, "⚠️ Ошибка при создании пересказа. Попробуйте через минуту.", parse_mode=None)
 
 
 @dp.callback_query(F.data.startswith("translate:"))
@@ -468,7 +818,7 @@ async def handle_translate_callback(callback: CallbackQuery) -> None:
         # Получаем оригинальный текст
         text = transcriptions.get(message_id)
         if not text:
-            await callback.message.answer("Текст не найден. Возможно, бот был перезапущен.")
+            await safe_send_message(callback, "Текст не найден. Возможно, бот был перезапущен.", parse_mode=None)
             return
 
         # Переводим через LLM
@@ -480,19 +830,19 @@ async def handle_translate_callback(callback: CallbackQuery) -> None:
 
         for i, part in enumerate(parts, start=1):
             if len(parts) == 1:
-                await callback.message.answer(
-                    f"**Перевод на {lang_label}:**\n\n{part}",
-                    parse_mode="Markdown"
+                await safe_send_message(
+                    callback,
+                    f"**Перевод на {lang_label}:**\n\n{part}"
                 )
             else:
-                await callback.message.answer(
-                    f"**Перевод на {lang_label} (часть {i}/{len(parts)}):**\n\n{part}",
-                    parse_mode="Markdown"
+                await safe_send_message(
+                    callback,
+                    f"**Перевод на {lang_label} (часть {i}/{len(parts)}):**\n\n{part}"
                 )
 
     except Exception as e:
         logger.exception("Error translating")
-        await callback.message.answer(f"Ошибка при переводе: {e}")
+        await safe_send_message(callback, "⚠️ Ошибка при переводе. Попробуйте через минуту.", parse_mode=None)
 
 
 @dp.message(F.text == "/start")
@@ -537,7 +887,7 @@ async def handle_check_requirements(callback: CallbackQuery) -> None:
 async def handle_unknown(message: Message) -> None:
     """Handle all other messages."""
     await message.answer(
-        "Я понимаю только голосовые сообщения и команду /start. Пришлите мне голосовое сообщение и я его расшифрую."
+        "Отправьте мне голосовое сообщение, аудио или видео — и я расшифрую его в текст."
     )
 
 
