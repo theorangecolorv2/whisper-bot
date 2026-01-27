@@ -7,7 +7,8 @@ import subprocess
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated
+from aiogram.filters import ChatMemberUpdatedFilter, IS_NOT_MEMBER, IS_MEMBER, ADMINISTRATOR
 from aiogram.exceptions import TelegramBadRequest
 from groq import Groq
 from dotenv import load_dotenv
@@ -486,20 +487,17 @@ async def handle_voice(message: Message) -> None:
 @dp.message(F.content_type == "audio")
 async def handle_audio(message: Message) -> None:
     """Handle audio files."""
-    in_group = is_group_chat(message)
+    # В групповых чатах игнорируем аудиофайлы (только voice и video_note)
+    if is_group_chat(message):
+        return
 
-    # В личных чатах проверяем требования, в группах - пропускаем
-    if not in_group:
-        channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
-        if not channel_ok or not bot_ok:
-            await send_requirements_message(message)
-            return
+    # Проверяем все требования
+    channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
+    if not channel_ok or not bot_ok:
+        await send_requirements_message(message)
+        return
 
-    # В группах отвечаем реплаем на исходное сообщение
-    status_msg = await message.answer(
-        "Расшифровываю аудио...",
-        reply_to_message_id=message.message_id if in_group else None
-    )
+    status_msg = await message.answer("Расшифровываю аудио...")
 
     try:
         file = await bot.get_file(message.audio.file_id)
@@ -895,14 +893,22 @@ async def handle_translate_callback(callback: CallbackQuery) -> None:
         await safe_send_message(callback, "⚠️ Ошибка при переводе. Попробуйте через минуту.", parse_mode=None)
 
 
+@dp.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_NOT_MEMBER >> (IS_MEMBER | ADMINISTRATOR)))
+async def handle_bot_added_to_group(event: ChatMemberUpdated) -> None:
+    """Обработчик добавления бота в группу."""
+    if event.chat.type in ("group", "supergroup"):
+        await bot.send_message(
+            event.chat.id,
+            "Привет! Я бот для расшифровки голосовых и видеосообщений⚡️\n"
+            "Я буду расшифровывать все голосовые и кружки в чате💛"
+        )
+
+
 @dp.message(F.text == "/start")
 async def handle_start(message: Message) -> None:
     """Handle /start command."""
-    # В групповых чатах просто показываем краткую информацию
+    # В групповых чатах не отвечаем на /start (приветствие при добавлении)
     if is_group_chat(message):
-        await message.answer(
-            "Привет! Я расшифровываю голосовые сообщения и видеокружки в этом чате."
-        )
         return
 
     # Проверяем все требования
