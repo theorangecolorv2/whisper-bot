@@ -41,6 +41,11 @@ MAX_RETRIES = 3
 RETRY_DELAYS = [1, 2, 3]  # секунды между попытками
 
 
+def is_group_chat(message: Message) -> bool:
+    """Проверяет, является ли чат групповым."""
+    return message.chat.type in ("group", "supergroup")
+
+
 async def safe_send_message(
     target: Message | CallbackQuery,
     text: str,
@@ -395,14 +400,21 @@ async def fix_punctuation(text: str) -> str:
 @dp.message(F.content_type == "voice")
 async def handle_voice(message: Message) -> None:
     """Handle voice messages and transcribe them using Whisper."""
-    # Проверяем все требования
-    channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
-    if not channel_ok or not bot_ok:
-        await send_requirements_message(message)
-        return
+    in_group = is_group_chat(message)
+
+    # В личных чатах проверяем требования, в группах - пропускаем
+    if not in_group:
+        channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
+        if not channel_ok or not bot_ok:
+            await send_requirements_message(message)
+            return
 
     # Отправляем сообщение и сохраняем его, чтобы потом отредактировать
-    status_msg = await message.answer("Расшифровываю...")
+    # В группах отвечаем реплаем на исходное сообщение
+    status_msg = await message.answer(
+        "Расшифровываю...",
+        reply_to_message_id=message.message_id if in_group else None
+    )
 
     try:
         # Download voice file
@@ -474,13 +486,20 @@ async def handle_voice(message: Message) -> None:
 @dp.message(F.content_type == "audio")
 async def handle_audio(message: Message) -> None:
     """Handle audio files."""
-    # Проверяем все требования
-    channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
-    if not channel_ok or not bot_ok:
-        await send_requirements_message(message)
-        return
+    in_group = is_group_chat(message)
 
-    status_msg = await message.answer("Расшифровываю аудио...")
+    # В личных чатах проверяем требования, в группах - пропускаем
+    if not in_group:
+        channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
+        if not channel_ok or not bot_ok:
+            await send_requirements_message(message)
+            return
+
+    # В группах отвечаем реплаем на исходное сообщение
+    status_msg = await message.answer(
+        "Расшифровываю аудио...",
+        reply_to_message_id=message.message_id if in_group else None
+    )
 
     try:
         file = await bot.get_file(message.audio.file_id)
@@ -555,6 +574,10 @@ async def handle_audio(message: Message) -> None:
 @dp.message(F.content_type == "video")
 async def handle_video(message: Message) -> None:
     """Handle video files - extract audio and transcribe."""
+    # В групповых чатах игнорируем обычные видео (только voice и video_note)
+    if is_group_chat(message):
+        return
+
     # Проверяем все требования
     channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
     if not channel_ok or not bot_ok:
@@ -668,13 +691,20 @@ async def handle_video(message: Message) -> None:
 @dp.message(F.content_type == "video_note")
 async def handle_video_note(message: Message) -> None:
     """Handle video notes (круглые видеосообщения) - extract audio and transcribe."""
-    # Проверяем все требования
-    channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
-    if not channel_ok or not bot_ok:
-        await send_requirements_message(message)
-        return
+    in_group = is_group_chat(message)
 
-    status_msg = await message.answer("Расшифровываю видеосообщение...")
+    # В личных чатах проверяем требования, в группах - пропускаем
+    if not in_group:
+        channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
+        if not channel_ok or not bot_ok:
+            await send_requirements_message(message)
+            return
+
+    # В группах отвечаем реплаем на исходное сообщение
+    status_msg = await message.answer(
+        "Расшифровываю видеосообщение...",
+        reply_to_message_id=message.message_id if in_group else None
+    )
 
     try:
         try:
@@ -868,6 +898,13 @@ async def handle_translate_callback(callback: CallbackQuery) -> None:
 @dp.message(F.text == "/start")
 async def handle_start(message: Message) -> None:
     """Handle /start command."""
+    # В групповых чатах просто показываем краткую информацию
+    if is_group_chat(message):
+        await message.answer(
+            "Привет! Я расшифровываю голосовые сообщения и видеокружки в этом чате."
+        )
+        return
+
     # Проверяем все требования
     channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
     if not channel_ok or not bot_ok:
@@ -906,6 +943,10 @@ async def handle_check_requirements(callback: CallbackQuery) -> None:
 @dp.message()
 async def handle_unknown(message: Message) -> None:
     """Handle all other messages."""
+    # В групповых чатах не отвечаем на неизвестные сообщения
+    if is_group_chat(message):
+        return
+
     await message.answer(
         "Отправьте мне голосовое сообщение, аудио или видео — и я расшифрую его в текст."
     )
