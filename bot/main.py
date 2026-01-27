@@ -564,7 +564,17 @@ async def handle_video(message: Message) -> None:
     status_msg = await message.answer("Извлекаю аудио из видео...")
 
     try:
-        file = await bot.get_file(message.video.file_id)
+        try:
+            file = await bot.get_file(message.video.file_id)
+        except TelegramBadRequest as e:
+            if "file is too big" in str(e).lower():
+                await safe_edit_message(
+                    status_msg,
+                    "⚠️ Видео слишком большое (максимум 20 МБ). Попробуйте отправить видео меньшего размера.",
+                    parse_mode=None
+                )
+                return
+            raise
         file_bytes = await bot.download_file(file.file_path)
 
         # Сохраняем видео во временный файл
@@ -667,7 +677,17 @@ async def handle_video_note(message: Message) -> None:
     status_msg = await message.answer("Расшифровываю видеосообщение...")
 
     try:
-        file = await bot.get_file(message.video_note.file_id)
+        try:
+            file = await bot.get_file(message.video_note.file_id)
+        except TelegramBadRequest as e:
+            if "file is too big" in str(e).lower():
+                await safe_edit_message(
+                    status_msg,
+                    "⚠️ Видеосообщение слишком большое (максимум 20 МБ).",
+                    parse_mode=None
+                )
+                return
+            raise
         file_bytes = await bot.download_file(file.file_path)
 
         # Сохраняем видео во временный файл
