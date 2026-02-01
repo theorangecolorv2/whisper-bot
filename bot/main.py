@@ -4,12 +4,18 @@ import logging
 import re
 import asyncio
 import subprocess
+from datetime import datetime
+from dataclasses import dataclass
 
 import aiohttp
+import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated
-from aiogram.filters import ChatMemberUpdatedFilter, IS_NOT_MEMBER, IS_MEMBER, ADMINISTRATOR
+from aiogram.filters import ChatMemberUpdatedFilter, Command, CommandStart, IS_NOT_MEMBER, IS_MEMBER, ADMINISTRATOR
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from groq import Groq
 from dotenv import load_dotenv
 
@@ -22,6 +28,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@ClevVPN")
 CLEVVPN_API_URL = os.getenv("CLEVVPN_API_URL", "http://89.111.143.90:8080")
+
+# Админы бота
+ADMIN_IDS = [586107799, 762967142]
+
+# Путь к базе данных
+DB_PATH = os.path.join(os.path.dirname(__file__), "bot.db")
 
 if not BOT_TOKEN or not GROQ_API_KEY:
     raise ValueError("BOT_TOKEN and GROQ_API_KEY must be set")
@@ -40,6 +52,144 @@ transcriptions: dict[int, str] = {}
 # Настройки retry
 MAX_RETRIES = 3
 RETRY_DELAYS = [1, 2, 3]  # секунды между попытками
+
+
+# ==================== Модель маркетинговых ссылок ====================
+
+@dataclass
+class MarketingLink:
+    id: int
+    code: str
+    clicks_count: int
+    paid_count: int
+    created_at: datetime
+    created_by: int
+
+
+class AdminStates(StatesGroup):
+    waiting_marketing_link_code = State()
+
+
+def is_admin(user_id: int) -> bool:
+    """Проверяет, является ли пользователь админом."""
+    return user_id in ADMIN_IDS
+
+
+async def init_db():
+    """Инициализация базы данных."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS marketing_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                clicks_count INTEGER DEFAULT 0,
+                paid_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by INTEGER NOT NULL
+            )
+        """)
+        await db.commit()
+
+
+async def get_all_marketing_links() -> list[MarketingLink]:
+    """Получает все маркетинговые ссылки."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM marketing_links ORDER BY created_at DESC"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                MarketingLink(
+                    id=row["id"],
+                    code=row["code"],
+                    clicks_count=row["clicks_count"],
+                    paid_count=row["paid_count"],
+                    created_at=datetime.fromisoformat(row["created_at"]) if isinstance(row["created_at"], str) else row["created_at"],
+                    created_by=row["created_by"],
+                )
+                for row in rows
+            ]
+
+
+async def get_marketing_link_by_id(link_id: int) -> MarketingLink | None:
+    """Получает ссылку по ID."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM marketing_links WHERE id = ?", (link_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return MarketingLink(
+                    id=row["id"],
+                    code=row["code"],
+                    clicks_count=row["clicks_count"],
+                    paid_count=row["paid_count"],
+                    created_at=datetime.fromisoformat(row["created_at"]) if isinstance(row["created_at"], str) else row["created_at"],
+                    created_by=row["created_by"],
+                )
+            return None
+
+
+async def get_marketing_link_by_code(code: str) -> MarketingLink | None:
+    """Получает ссылку по коду."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM marketing_links WHERE code = ?", (code,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return MarketingLink(
+                    id=row["id"],
+                    code=row["code"],
+                    clicks_count=row["clicks_count"],
+                    paid_count=row["paid_count"],
+                    created_at=datetime.fromisoformat(row["created_at"]) if isinstance(row["created_at"], str) else row["created_at"],
+                    created_by=row["created_by"],
+                )
+            return None
+
+
+async def create_marketing_link(code: str, created_by: int) -> MarketingLink:
+    """Создает новую маркетинговую ссылку."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO marketing_links (code, created_by) VALUES (?, ?)",
+            (code, created_by),
+        )
+        await db.commit()
+        link_id = cursor.lastrowid
+        return MarketingLink(
+            id=link_id,
+            code=code,
+            clicks_count=0,
+            paid_count=0,
+            created_at=datetime.now(),
+            created_by=created_by,
+        )
+
+
+async def increment_marketing_link_clicks(code: str) -> bool:
+    """Увеличивает счетчик кликов по ссылке."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE marketing_links SET clicks_count = clicks_count + 1 WHERE code = ?",
+            (code,),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def delete_marketing_link(link_id: int) -> bool:
+    """Удаляет маркетинговую ссылку."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM marketing_links WHERE id = ?", (link_id,)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
 
 
 def is_group_chat(message: Message) -> bool:
@@ -904,9 +1054,278 @@ async def handle_bot_added_to_group(event: ChatMemberUpdated) -> None:
         )
 
 
-@dp.message(F.text == "/start")
+# ==================== Админ-панель: маркетинговые ссылки ====================
+
+@dp.message(Command("admin"))
+async def handle_admin_command(message: Message) -> None:
+    """Команда /admin для входа в админ-панель."""
+    if not is_admin(message.from_user.id):
+        return
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🔗 Ссылки для блогеров", callback_data="admin_marketing_links"))
+
+    await message.answer(
+        "🔐 <b>Админ-панель</b>\n\n"
+        "Выберите раздел:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@dp.callback_query(F.data == "admin_back")
+async def handle_admin_back(callback: CallbackQuery, state: FSMContext) -> None:
+    """Возврат в главное меню админки."""
+    if not is_admin(callback.from_user.id):
+        return
+
+    await state.clear()
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🔗 Ссылки для блогеров", callback_data="admin_marketing_links"))
+
+    await callback.message.edit_text(
+        "🔐 <b>Админ-панель</b>\n\n"
+        "Выберите раздел:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_marketing_links")
+async def handle_admin_marketing_links(callback: CallbackQuery) -> None:
+    """Список маркетинговых ссылок."""
+    if not is_admin(callback.from_user.id):
+        return
+
+    links = await get_all_marketing_links()
+
+    builder = InlineKeyboardBuilder()
+    for link in links[:20]:
+        builder.row(InlineKeyboardButton(
+            text=f"🔗 {link.code} ({link.clicks_count}/{link.paid_count})",
+            callback_data=f"admin_mlink_{link.id}",
+        ))
+    builder.row(InlineKeyboardButton(text="➕ Создать ссылку", callback_data="admin_mlink_create"))
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back"))
+
+    await callback.message.edit_text(
+        "🔗 <b>Ссылки для блогеров</b>\n\n"
+        "Формат: название (переходы/оплаты)\n\n"
+        "Выберите ссылку для просмотра статистики или создайте новую:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_mlink_create")
+async def handle_mlink_create(callback: CallbackQuery, state: FSMContext) -> None:
+    """Начало создания ссылки."""
+    if not is_admin(callback.from_user.id):
+        return
+
+    await state.set_state(AdminStates.waiting_marketing_link_code)
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="admin_marketing_links"))
+
+    bot_info = await callback.bot.get_me()
+
+    await callback.message.edit_text(
+        "🔗 <b>Создание ссылки для блогера</b>\n\n"
+        "Введите название ссылки (только латиница, без пробелов):\n\n"
+        f"Например: <code>mamix</code>\n"
+        f"Диплинк будет: <code>t.me/{bot_info.username}?start=mamix</code>",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_marketing_link_code)
+async def handle_mlink_code_input(message: Message, state: FSMContext) -> None:
+    """Обработка ввода кода ссылки."""
+    if not is_admin(message.from_user.id):
+        return
+
+    code = message.text.strip().lower()
+
+    if not re.match(r'^[a-z0-9_-]+$', code):
+        await message.answer(
+            "❌ Название может содержать только латинские буквы, цифры, _ и -\n\n"
+            "Попробуйте ещё раз:"
+        )
+        return
+
+    existing = await get_marketing_link_by_code(code)
+    if existing:
+        await message.answer(
+            f"❌ Ссылка с названием <code>{code}</code> уже существует.\n\n"
+            "Введите другое название:",
+            parse_mode="HTML",
+        )
+        return
+
+    link = await create_marketing_link(code=code, created_by=message.from_user.id)
+
+    await state.clear()
+
+    bot_info = await message.bot.get_me()
+    deeplink = f"https://t.me/{bot_info.username}?start={code}"
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="➕ Создать ещё", callback_data="admin_mlink_create"))
+    builder.row(InlineKeyboardButton(text="📋 К списку", callback_data="admin_marketing_links"))
+    builder.row(InlineKeyboardButton(text="🔙 В меню", callback_data="admin_back"))
+
+    await message.answer(
+        f"✅ <b>Ссылка создана!</b>\n\n"
+        f"📝 Название: <code>{link.code}</code>\n"
+        f"🔗 Диплинк:\n<code>{deeplink}</code>",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@dp.callback_query(
+    F.data.startswith("admin_mlink_")
+    & ~F.data.in_(["admin_mlink_create"])
+    & ~F.data.startswith("admin_mlink_delete_")
+    & ~F.data.startswith("admin_mlink_confirm_")
+)
+async def handle_mlink_detail(callback: CallbackQuery) -> None:
+    """Детали ссылки."""
+    if not is_admin(callback.from_user.id):
+        return
+
+    link_id = int(callback.data.replace("admin_mlink_", ""))
+
+    link = await get_marketing_link_by_id(link_id)
+
+    if not link:
+        await callback.answer("Ссылка не найдена", show_alert=True)
+        return
+
+    bot_info = await callback.bot.get_me()
+    deeplink = f"https://t.me/{bot_info.username}?start={link.code}"
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🗑 Удалить", callback_data=f"admin_mlink_delete_{link.id}"))
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="admin_marketing_links"))
+
+    await callback.message.edit_text(
+        f"🔗 <b>Ссылка: {link.code}</b>\n\n"
+        f"👥 Переходов: <b>{link.clicks_count}</b>\n"
+        f"💰 Оплат: <b>{link.paid_count}</b>\n"
+        f"📅 Создана: {link.created_at.strftime('%d.%m.%Y %H:%M')}\n\n"
+        f"🔗 Диплинк:\n<code>{deeplink}</code>",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_mlink_delete_"))
+async def handle_mlink_delete_confirm(callback: CallbackQuery) -> None:
+    """Подтверждение удаления ссылки."""
+    if not is_admin(callback.from_user.id):
+        return
+
+    link_id = int(callback.data.replace("admin_mlink_delete_", ""))
+
+    link = await get_marketing_link_by_id(link_id)
+
+    if not link:
+        await callback.answer("Ссылка не найдена", show_alert=True)
+        return
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"admin_mlink_confirm_{link.id}"))
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_mlink_{link.id}"))
+
+    await callback.message.edit_text(
+        f"🗑 <b>Удаление ссылки</b>\n\n"
+        f"Вы уверены, что хотите удалить ссылку <code>{link.code}</code>?\n\n"
+        f"Статистика будет потеряна:\n"
+        f"• Переходов: {link.clicks_count}\n"
+        f"• Оплат: {link.paid_count}",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_mlink_confirm_"))
+async def handle_mlink_delete(callback: CallbackQuery) -> None:
+    """Удаление ссылки."""
+    if not is_admin(callback.from_user.id):
+        return
+
+    link_id = int(callback.data.replace("admin_mlink_confirm_", ""))
+
+    deleted = await delete_marketing_link(link_id)
+
+    if deleted:
+        await callback.answer("✅ Ссылка удалена", show_alert=True)
+    else:
+        await callback.answer("❌ Ошибка удаления", show_alert=True)
+        return
+
+    links = await get_all_marketing_links()
+
+    builder = InlineKeyboardBuilder()
+    for link in links[:20]:
+        builder.row(InlineKeyboardButton(
+            text=f"🔗 {link.code} ({link.clicks_count}/{link.paid_count})",
+            callback_data=f"admin_mlink_{link.id}",
+        ))
+    builder.row(InlineKeyboardButton(text="➕ Создать ссылку", callback_data="admin_mlink_create"))
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back"))
+
+    await callback.message.edit_text(
+        "🔗 <b>Ссылки для блогеров</b>\n\n"
+        "Формат: название (переходы/оплаты)\n\n"
+        "Выберите ссылку для просмотра статистики или создайте новую:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+
+
+# ==================== Команда /start ====================
+
+@dp.message(CommandStart(deep_link=True))
+async def handle_start_with_deeplink(message: Message) -> None:
+    """Handle /start command with deep link parameter."""
+    # В групповых чатах не отвечаем на /start
+    if is_group_chat(message):
+        return
+
+    # Извлекаем параметр из /start <param>
+    args = message.text.split(maxsplit=1)
+    if len(args) > 1:
+        ref_code = args[1].strip().lower()
+        # Увеличиваем счетчик переходов если такая ссылка существует
+        await increment_marketing_link_clicks(ref_code)
+
+    # Проверяем все требования
+    channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
+    if not channel_ok or not bot_ok:
+        await send_requirements_message(message)
+        return
+
+    # Все требования выполнены - показываем приветственное сообщение
+    await message.answer(
+        "Привет! Я бот для расшифровки голосовых сообщений.\n\n"
+        "Отправьте мне голосовое сообщение или аудиофайл, и я расшифрую его в текст.\n\n"
+        "Также я могу сделать краткий пересказ или перевести текст."
+    )
+
+
+@dp.message(CommandStart())
 async def handle_start(message: Message) -> None:
-    """Handle /start command."""
+    """Handle /start command without parameters."""
     # В групповых чатах не отвечаем на /start (приветствие при добавлении)
     if is_group_chat(message):
         return
@@ -960,6 +1379,8 @@ async def handle_unknown(message: Message) -> None:
 
 async def main() -> None:
     logger.info("Starting bot...")
+    await init_db()
+    logger.info("Database initialized")
     await dp.start_polling(bot)
 
 
