@@ -16,7 +16,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from groq import Groq
+from groq import Groq, RateLimitError, APIStatusError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY_2 = os.getenv("GROQ_API_KEY_2")  # Запасной ключ
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@ClevVPN")
 CLEVVPN_API_URL = os.getenv("CLEVVPN_API_URL", "http://89.111.143.90:8080")
 
@@ -40,7 +41,82 @@ if not BOT_TOKEN or not GROQ_API_KEY:
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-groq_client = Groq(api_key=GROQ_API_KEY)
+
+# Список Groq клиентов для fallback при rate limit
+groq_clients = [Groq(api_key=GROQ_API_KEY)]
+if GROQ_API_KEY_2:
+    groq_clients.append(Groq(api_key=GROQ_API_KEY_2))
+    logger.info("Загружено 2 GROQ API ключа")
+else:
+    logger.info("Загружен 1 GROQ API ключ (запасной не настроен)")
+
+# Индекс текущего клиента
+current_client_index = 0
+
+
+def get_groq_client() -> Groq:
+    """Возвращает текущий Groq клиент."""
+    return groq_clients[current_client_index]
+
+
+def switch_groq_client() -> bool:
+    """Переключает на следующий клиент. Возвращает True если переключение успешно."""
+    global current_client_index
+    next_index = (current_client_index + 1) % len(groq_clients)
+    if next_index != current_client_index or len(groq_clients) == 1:
+        if next_index == current_client_index:
+            return False  # Нет других клиентов
+        current_client_index = next_index
+        logger.info(f"Переключено на GROQ клиент #{current_client_index + 1}")
+        return True
+    return False
+
+
+# Для обратной совместимости
+groq_client = groq_clients[0]
+
+
+def call_chat_completion(**kwargs):
+    """Вызов chat.completions.create с автоматическим fallback на другой ключ при rate limit."""
+    global current_client_index
+    tried_clients = set()
+
+    while len(tried_clients) < len(groq_clients):
+        client = groq_clients[current_client_index]
+        tried_clients.add(current_client_index)
+
+        try:
+            return client.chat.completions.create(**kwargs)
+        except (RateLimitError, APIStatusError) as e:
+            error_msg = str(e)
+            if "rate_limit" in error_msg.lower() or "429" in error_msg or isinstance(e, RateLimitError):
+                logger.warning(f"Rate limit на клиенте #{current_client_index + 1}, переключаем...")
+                if switch_groq_client():
+                    continue
+            raise
+    raise RateLimitError("Все API ключи исчерпали лимит запросов")
+
+
+def call_audio_transcription(**kwargs):
+    """Вызов audio.transcriptions.create с автоматическим fallback на другой ключ при rate limit."""
+    global current_client_index
+    tried_clients = set()
+
+    while len(tried_clients) < len(groq_clients):
+        client = groq_clients[current_client_index]
+        tried_clients.add(current_client_index)
+
+        try:
+            return client.audio.transcriptions.create(**kwargs)
+        except (RateLimitError, APIStatusError) as e:
+            error_msg = str(e)
+            if "rate_limit" in error_msg.lower() or "429" in error_msg or isinstance(e, RateLimitError):
+                logger.warning(f"Rate limit на клиенте #{current_client_index + 1}, переключаем...")
+                if switch_groq_client():
+                    continue
+            raise
+    raise RateLimitError("Все API ключи исчерпали лимит запросов")
+
 
 # Модель для пересказа, перевода и пунктуации
 LLM_MODEL = "openai/gpt-oss-120b"
@@ -485,7 +561,7 @@ async def summarize_text(text: str) -> str:
     Создает краткий пересказ текста через LLM.
     Промпт просит сохранить все важное, но сделать текст короче.
     """
-    response = groq_client.chat.completions.create(
+    response = call_chat_completion(
         model=LLM_MODEL,
         messages=[
             {
@@ -509,7 +585,7 @@ async def translate_text(text: str, target_lang: str) -> str:
     """
     lang_name = "русский" if target_lang == "ru" else "английский"
 
-    response = groq_client.chat.completions.create(
+    response = call_chat_completion(
         model=LLM_MODEL,
         messages=[
             {
@@ -531,7 +607,7 @@ async def fix_punctuation(text: str) -> str:
     Исправляет пунктуацию в тексте через LLM.
     Добавляет точки, запятые, заглавные буквы где нужно.
     """
-    response = groq_client.chat.completions.create(
+    response = call_chat_completion(
         model=LLM_MODEL,
         messages=[
             {
@@ -580,7 +656,7 @@ async def handle_voice(message: Message) -> None:
         try:
             # Transcribe with Whisper via Groq
             with open(tmp_path, "rb") as audio_file:
-                transcription = groq_client.audio.transcriptions.create(
+                transcription = call_audio_transcription(
                     file=(tmp_path, audio_file.read()),
                     model="whisper-large-v3",
                 )
@@ -665,7 +741,7 @@ async def handle_audio(message: Message) -> None:
 
         try:
             with open(tmp_path, "rb") as audio_file:
-                transcription = groq_client.audio.transcriptions.create(
+                transcription = call_audio_transcription(
                     file=(tmp_path, audio_file.read()),
                     model="whisper-large-v3",
                 )
@@ -781,7 +857,7 @@ async def handle_video(message: Message) -> None:
 
             # Транскрибируем аудио
             with open(audio_path, "rb") as audio_file:
-                transcription = groq_client.audio.transcriptions.create(
+                transcription = call_audio_transcription(
                     file=(audio_path, audio_file.read()),
                     model="whisper-large-v3",
                 )
@@ -899,7 +975,7 @@ async def handle_video_note(message: Message) -> None:
 
             # Транскрибируем аудио
             with open(audio_path, "rb") as audio_file:
-                transcription = groq_client.audio.transcriptions.create(
+                transcription = call_audio_transcription(
                     file=(audio_path, audio_file.read()),
                     model="whisper-large-v3",
                 )
