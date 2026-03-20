@@ -184,6 +184,14 @@ async def init_db():
                 FOREIGN KEY (marketing_link_id) REFERENCES marketing_links(id) ON DELETE SET NULL
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS broadcast_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER UNIQUE NOT NULL,
+                username TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
 
 
@@ -313,7 +321,29 @@ async def save_user(telegram_id: int, username: str | None, marketing_link_code:
                 "UPDATE users SET marketing_link_id = ? WHERE telegram_id = ? AND marketing_link_id IS NULL",
                 (marketing_link_id, telegram_id),
             )
+        await db.execute(
+            "INSERT OR IGNORE INTO broadcast_users (telegram_id, username) VALUES (?, ?)",
+            (telegram_id, username),
+        )
+        await db.execute(
+            "UPDATE broadcast_users SET username = ? WHERE telegram_id = ?",
+            (username, telegram_id),
+        )
         await db.commit()
+
+
+async def get_all_broadcast_users() -> list[tuple[int, str | None]]:
+    """Returns all broadcast users as (telegram_id, username) tuples."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT telegram_id, username FROM broadcast_users ORDER BY id")
+        return await cursor.fetchall()
+
+
+async def get_broadcast_users_count() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM broadcast_users")
+        row = await cursor.fetchone()
+        return row[0]
 
 
 async def get_all_users() -> list[User]:
@@ -1459,7 +1489,7 @@ async def handle_admin_broadcast(callback: CallbackQuery, state: FSMContext) -> 
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back"))
 
-    users_count = await get_users_count()
+    users_count = await get_broadcast_users_count()
 
     await callback.message.edit_text(
         "📢 <b>Рассылка</b>\n\n"
@@ -1592,30 +1622,30 @@ async def handle_broadcast_all(callback: CallbackQuery, state: FSMContext) -> No
     )
     await callback.answer()
 
-    users = await get_all_users()
+    broadcast_list = await get_all_broadcast_users()
 
-    total = len(users)
+    total = len(broadcast_list)
     sent = 0
     failed = 0
 
-    for i, user in enumerate(users):
+    for i, (telegram_id, username) in enumerate(broadcast_list):
         try:
             if data.get("photo_id"):
                 await bot.send_photo(
-                    chat_id=user.telegram_id,
+                    chat_id=telegram_id,
                     photo=data["photo_id"],
                     caption=data.get("caption") or None,
                     parse_mode="HTML",
                 )
             else:
                 await bot.send_message(
-                    chat_id=user.telegram_id,
+                    chat_id=telegram_id,
                     text=data.get("text", ""),
                     parse_mode="HTML",
                 )
             sent += 1
         except Exception as e:
-            logger.warning(f"Failed to send to user {user.telegram_id}: {e}")
+            logger.warning(f"Failed to send to user {telegram_id}: {e}")
             failed += 1
 
         if (i + 1) % 30 == 0:
