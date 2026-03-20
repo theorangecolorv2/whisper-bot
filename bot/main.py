@@ -31,7 +31,7 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "@ClevVPN")
 CLEVVPN_API_URL = os.getenv("CLEVVPN_API_URL", "http://89.111.143.90:8080")
 
 # Админы бота
-ADMIN_IDS = [586107799, 762967142]
+ADMIN_IDS = [586107799, 762967142, 6682411163]
 
 # Путь к базе данных
 DB_PATH = os.path.join(os.path.dirname(__file__), "bot.db")
@@ -142,8 +142,18 @@ class MarketingLink:
     created_by: int
 
 
+@dataclass
+class User:
+    id: int
+    telegram_id: int
+    username: str | None
+    marketing_link_id: int | None
+    created_at: datetime
+
+
 class AdminStates(StatesGroup):
     waiting_marketing_link_code = State()
+    waiting_broadcast_message = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -162,6 +172,16 @@ async def init_db():
                 paid_count INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 created_by INTEGER NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER UNIQUE NOT NULL,
+                username TEXT,
+                marketing_link_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (marketing_link_id) REFERENCES marketing_links(id) ON DELETE SET NULL
             )
         """)
         await db.commit()
@@ -266,6 +286,60 @@ async def delete_marketing_link(link_id: int) -> bool:
         )
         await db.commit()
         return cursor.rowcount > 0
+
+
+# ==================== Функции для работы с пользователями ====================
+
+
+async def save_user(telegram_id: int, username: str | None, marketing_link_code: str | None = None) -> None:
+    """Сохраняет пользователя в БД. Если уже существует — обновляет username."""
+    marketing_link_id = None
+    if marketing_link_code:
+        link = await get_marketing_link_by_code(marketing_link_code)
+        if link:
+            marketing_link_id = link.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO users (telegram_id, username, marketing_link_id) VALUES (?, ?, ?)",
+            (telegram_id, username, marketing_link_id),
+        )
+        await db.execute(
+            "UPDATE users SET username = ? WHERE telegram_id = ?",
+            (username, telegram_id),
+        )
+        if marketing_link_id:
+            await db.execute(
+                "UPDATE users SET marketing_link_id = ? WHERE telegram_id = ? AND marketing_link_id IS NULL",
+                (marketing_link_id, telegram_id),
+            )
+        await db.commit()
+
+
+async def get_all_users() -> list[User]:
+    """Возвращает всех пользователей."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM users ORDER BY created_at DESC")
+        rows = await cursor.fetchall()
+        return [
+            User(
+                id=row["id"],
+                telegram_id=row["telegram_id"],
+                username=row["username"],
+                marketing_link_id=row["marketing_link_id"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+
+async def get_users_count() -> int:
+    """Возвращает количество пользователей."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM users")
+        row = await cursor.fetchone()
+        return row[0]
 
 
 def is_group_chat(message: Message) -> bool:
@@ -1140,6 +1214,7 @@ async def handle_admin_command(message: Message) -> None:
 
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="🔗 Ссылки для блогеров", callback_data="admin_marketing_links"))
+    builder.row(InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast"))
 
     await message.answer(
         "🔐 <b>Админ-панель</b>\n\n"
@@ -1159,6 +1234,7 @@ async def handle_admin_back(callback: CallbackQuery, state: FSMContext) -> None:
 
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="🔗 Ссылки для блогеров", callback_data="admin_marketing_links"))
+    builder.row(InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast"))
 
     await callback.message.edit_text(
         "🔐 <b>Админ-панель</b>\n\n"
@@ -1369,6 +1445,199 @@ async def handle_mlink_delete(callback: CallbackQuery) -> None:
     )
 
 
+# ==================== Админ-панель: рассылка ====================
+
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def handle_admin_broadcast(callback: CallbackQuery, state: FSMContext) -> None:
+    """Начало рассылки."""
+    if not is_admin(callback.from_user.id):
+        return
+
+    await state.set_state(AdminStates.waiting_broadcast_message)
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back"))
+
+    users_count = await get_users_count()
+
+    await callback.message.edit_text(
+        "📢 <b>Рассылка</b>\n\n"
+        f"👥 Пользователей в базе: {users_count}\n\n"
+        "Отправьте сообщение для рассылки.\n\n"
+        "Поддерживается:\n"
+        "• Текст (с HTML-форматированием)\n"
+        "• Фото с подписью",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_broadcast_message, F.photo)
+async def handle_broadcast_photo(message: Message, state: FSMContext) -> None:
+    """Получение фото для рассылки."""
+    if not is_admin(message.from_user.id):
+        return
+
+    photo_id = message.photo[-1].file_id
+    caption = message.caption or ""
+
+    await state.update_data(photo_id=photo_id, caption=caption, text=None)
+    await state.set_state(None)
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🧪 Тест (админам)", callback_data="broadcast_test"))
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back"))
+
+    await message.answer_photo(
+        photo=photo_id,
+        caption=f"{caption}\n\n<i>👆 Предпросмотр сообщения</i>" if caption else "<i>👆 Предпросмотр сообщения</i>",
+        parse_mode="HTML",
+    )
+    await message.answer(
+        "Выберите действие:",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@dp.message(AdminStates.waiting_broadcast_message, F.text)
+async def handle_broadcast_text(message: Message, state: FSMContext) -> None:
+    """Получение текста для рассылки."""
+    if not is_admin(message.from_user.id):
+        return
+
+    text = message.text
+
+    await state.update_data(text=text, photo_id=None, caption=None)
+    await state.set_state(None)
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🧪 Тест (админам)", callback_data="broadcast_test"))
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back"))
+
+    await message.answer(
+        f"{text}\n\n<i>👆 Предпросмотр сообщения</i>",
+        parse_mode="HTML",
+    )
+    await message.answer(
+        "Выберите действие:",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@dp.callback_query(F.data == "broadcast_test")
+async def handle_broadcast_test(callback: CallbackQuery, state: FSMContext) -> None:
+    """Тестовая отправка админам."""
+    if not is_admin(callback.from_user.id):
+        return
+
+    data = await state.get_data()
+    await callback.answer("Отправляю тест админам...")
+
+    sent = 0
+    failed = 0
+
+    for admin_id in ADMIN_IDS:
+        try:
+            if data.get("photo_id"):
+                await bot.send_photo(
+                    chat_id=admin_id,
+                    photo=data["photo_id"],
+                    caption=data.get("caption") or None,
+                    parse_mode="HTML",
+                )
+            else:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=data.get("text", ""),
+                    parse_mode="HTML",
+                )
+            sent += 1
+        except Exception as e:
+            logger.warning(f"Failed to send test to admin {admin_id}: {e}")
+            failed += 1
+        await asyncio.sleep(0.1)
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="📢 Отправить ВСЕМ", callback_data="broadcast_all"))
+    builder.row(InlineKeyboardButton(text="✏️ Изменить", callback_data="admin_broadcast"))
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back"))
+
+    await callback.message.edit_text(
+        f"🧪 <b>Тестовая рассылка завершена</b>\n\n"
+        f"✅ Отправлено: {sent}\n"
+        f"❌ Ошибок: {failed}\n\n"
+        f"Теперь можете отправить всем пользователям.",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@dp.callback_query(F.data == "broadcast_all")
+async def handle_broadcast_all(callback: CallbackQuery, state: FSMContext) -> None:
+    """Отправка рассылки всем пользователям."""
+    if not is_admin(callback.from_user.id):
+        return
+
+    data = await state.get_data()
+
+    if not data.get("text") and not data.get("photo_id"):
+        await callback.answer("Сначала создайте сообщение", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "📢 <b>Рассылка запущена...</b>\n\nПодождите, это может занять время.",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+    users = await get_all_users()
+
+    total = len(users)
+    sent = 0
+    failed = 0
+
+    for i, user in enumerate(users):
+        try:
+            if data.get("photo_id"):
+                await bot.send_photo(
+                    chat_id=user.telegram_id,
+                    photo=data["photo_id"],
+                    caption=data.get("caption") or None,
+                    parse_mode="HTML",
+                )
+            else:
+                await bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=data.get("text", ""),
+                    parse_mode="HTML",
+                )
+            sent += 1
+        except Exception as e:
+            logger.warning(f"Failed to send to user {user.telegram_id}: {e}")
+            failed += 1
+
+        if (i + 1) % 30 == 0:
+            await asyncio.sleep(1)
+        else:
+            await asyncio.sleep(0.05)
+
+    await state.clear()
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🔙 В меню", callback_data="admin_back"))
+
+    await callback.message.edit_text(
+        f"📢 <b>Рассылка завершена!</b>\n\n"
+        f"👥 Всего: {total}\n"
+        f"✅ Отправлено: {sent}\n"
+        f"❌ Ошибок: {failed}",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+
+
 # ==================== Команда /start ====================
 
 @dp.message(CommandStart(deep_link=True))
@@ -1379,11 +1648,19 @@ async def handle_start_with_deeplink(message: Message) -> None:
         return
 
     # Извлекаем параметр из /start <param>
+    ref_code = None
     args = message.text.split(maxsplit=1)
     if len(args) > 1:
         ref_code = args[1].strip().lower()
         # Увеличиваем счетчик переходов если такая ссылка существует
         await increment_marketing_link_clicks(ref_code)
+
+    # Сохраняем пользователя в БД
+    await save_user(
+        telegram_id=message.from_user.id,
+        username=message.from_user.username,
+        marketing_link_code=ref_code,
+    )
 
     # Проверяем все требования
     channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
@@ -1405,6 +1682,12 @@ async def handle_start(message: Message) -> None:
     # В групповых чатах не отвечаем на /start (приветствие при добавлении)
     if is_group_chat(message):
         return
+
+    # Сохраняем пользователя в БД
+    await save_user(
+        telegram_id=message.from_user.id,
+        username=message.from_user.username,
+    )
 
     # Проверяем все требования
     channel_ok, bot_ok = await check_all_requirements(message.from_user.id)
